@@ -1,2 +1,4 @@
 [server]
-maxUploadSize = 30720
+# それぞれMB単位。必要最小限に留めること
+maxUploadSize = 1024       # 例: 1GB
+maxMessageSize = 1024      # 例: 1GB

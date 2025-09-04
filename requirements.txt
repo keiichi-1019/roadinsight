@@ -4,5 +4,4 @@ numpy
 matplotlib
 folium
 streamlit-folium
-pydeck
 pyarrow
