@@ -1,6 +1,18 @@
+# map_plot_tab.py
+# -----------------------------------------------------------------------------
+# 大容量CSV/ZIPでも落ちにくい地図可視化タブ
+# - 先頭数万行のみで緯度経度の自動判定
+# - チャンク読み + ベルヌーイ間引き + リザーバサンプリングで常に上限件数以内
+# - 点が多い場合もバッチ分割でFoliumに流す
+# -----------------------------------------------------------------------------
+
+from __future__ import annotations
+import io
 import json
 import math
 import zipfile
+from typing import Iterable, List, Tuple
+
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -20,18 +32,13 @@ PLOT_IMG = f"{EXAMPLE_DIR}/Plot_display_example.png"
 MESH_IMG = f"{EXAMPLE_DIR}/Mesh_display_example.png"
 HEAT_IMG = f"{EXAMPLE_DIR}/Heat_map_display_example.png"
 
-# ---------- small utils ------------------------------------------------------
-def _read_first_csv(file):
-    name = file.name.lower()
-    if name.endswith(".zip"):
-        with zipfile.ZipFile(file) as zf:
-            for n in zf.namelist():
-                if n.lower().endswith(".csv"):
-                    with zf.open(n) as f:
-                        return pd.read_csv(f), f"{file.name} / {n}"
-        return None, None
-    return pd.read_csv(file), file.name
+# パフォーマンス関連の定数
+MAX_POINTS = 200_000          # 点描画で保持する最大件数
+CHUNK_ROWS = 200_000          # CSV読み込みチャンクサイズ
+RANDOM_SEED = 0               # サンプリングの乱数シード
+BATCH_GEOJSON = 50_000        # Foliumへ投げる1バッチ数
 
+# ---------- small utils ------------------------------------------------------
 def _idx_to_excel_col(idx: int) -> str:
     s, n = "", idx
     while True:
@@ -42,11 +49,11 @@ def _idx_to_excel_col(idx: int) -> str:
         n -= 1
     return s
 
-def _excel_label_map(cols):
+def _excel_label_map(cols: Iterable[str]):
     """{'A': colname0, 'B': colname1, ...} を返す"""
     return {_idx_to_excel_col(i): c for i, c in enumerate(cols)}
 
-def _score_in_range(series, low, high):
+def _score_in_range(series: pd.Series, low: float, high: float) -> float:
     v = pd.to_numeric(series, errors="coerce").dropna()
     if len(v) < 10:
         return -1.0
@@ -72,45 +79,80 @@ def _autodetect_lon_lat(df: pd.DataFrame):
         lat = None
     return lon, lat
 
-# ---------- preprocessing -----------------------------------------------------
-def _make_work_df(
-    df: pd.DataFrame,
-    value_col: str | None,
-    lon_override: str | None = None,
-    lat_override: str | None = None
-):
-    # オーバーライド優先（未指定時は自動検出）
-    if lon_override and lat_override:
-        lon_col, lat_col = lon_override, lat_override
+# ---------- streaming readers ------------------------------------------------
+def _reset_uploaded_file(file):
+    try:
+        file.seek(0)
+    except Exception:
+        pass
+
+def _open_first_csv_in_zip(file) -> io.TextIOBase:
+    zf = zipfile.ZipFile(file)
+    for n in zf.namelist():
+        if n.lower().endswith(".csv"):
+            return io.TextIOWrapper(zf.open(n, "r"), encoding="utf-8", errors="ignore")
+    raise ValueError("ZIP内にCSVが見つかりません。")
+
+def _iter_csv_chunks(file, usecols=None, dtype=None):
+    """CSV/ZIPをチャンクで返すジェネレータ"""
+    _reset_uploaded_file(file)
+    name = file.name.lower()
+    if name.endswith(".zip"):
+        f = _open_first_csv_in_zip(file)
+        yield from pd.read_csv(f, chunksize=CHUNK_ROWS, usecols=usecols, dtype=dtype)
     else:
-        lon_col, lat_col = _autodetect_lon_lat(df)
-        if (lon_override and lon_override in df.columns):
-            lon_col = lon_override
-        if (lat_override and lat_override in df.columns):
-            lat_col = lat_override
+        yield from pd.read_csv(file, chunksize=CHUNK_ROWS, usecols=usecols, dtype=dtype)
 
-    if lon_col is None or lat_col is None:
-        raise ValueError("緯度・経度列を特定できません。手動で指定してください。")
+def _autodetect_with_sample(file, sample_rows=50_000):
+    """巨大CSVの自動判定は先頭数万行のみで実施"""
+    it = _iter_csv_chunks(file)
+    head = next(it)
+    if len(head) > sample_rows:
+        head = head.head(sample_rows)
+    lon, lat = _autodetect_lon_lat(head)
+    return lon, lat, head
 
-    cols = [lat_col, lon_col]
-    if value_col and value_col not in cols:
-        cols.append(value_col)
+def _stream_sample_points(file, value_col: str | None, lon_col: str, lat_col: str, keep_pct=100.0):
+    """
+    逐次読み＋確率間引き＋リザーバサンプリングで MAX_POINTS 以内に収める。
+    戻り値: DataFrame(lat, lon[, val])
+    """
+    p = max(0.0001, min(1.0, float(keep_pct) / 100.0))
+    rng = np.random.default_rng(RANDOM_SEED)
 
-    w = df[cols].copy().rename(columns={lat_col: "lat", lon_col: "lon"})
-    w["lat"] = pd.to_numeric(w["lat"], errors="coerce")
-    w["lon"] = pd.to_numeric(w["lon"], errors="coerce")
-    if value_col:
-        w["val"] = pd.to_numeric(w[value_col], errors="coerce")
-    w = w.dropna(subset=["lat", "lon"])
-    w = w[w["lat"].between(20, 46) & w["lon"].between(122, 154)]
-    if w.empty:
-        raise ValueError("日本域（lat:20–46, lon:122–154）内に有効な点がありません。列の指定を確認してください。")
-    # 軽量化
-    w["lat"] = w["lat"].astype("float32").round(5)
-    w["lon"] = w["lon"].astype("float32").round(5)
-    if "val" in w.columns:
-        w["val"] = w["val"].astype("float32")
-    return w
+    usecols = [c for c in [lat_col, lon_col, value_col] if c]
+    reservoir: List[Tuple] = []
+    accepted = 0
+
+    for chunk in _iter_csv_chunks(file, usecols=usecols):
+        w = chunk.rename(columns={lat_col: "lat", lon_col: "lon"}).copy()
+        w["lat"] = pd.to_numeric(w["lat"], errors="coerce")
+        w["lon"] = pd.to_numeric(w["lon"], errors="coerce")
+        if value_col:
+            w["val"] = pd.to_numeric(w[value_col], errors="coerce")
+        w = w.dropna(subset=["lat", "lon"])
+        w = w[w["lat"].between(20, 46) & w["lon"].between(122, 154)]
+
+        # 軽量化
+        w["lat"] = w["lat"].astype("float32").round(5)
+        w["lon"] = w["lon"].astype("float32").round(5)
+        if value_col and "val" in w:
+            w["val"] = w["val"].astype("float32")
+
+        # Bernoulli → Reservoir
+        for row in w.itertuples(index=False):
+            if rng.random() > p:
+                continue
+            accepted += 1
+            if len(reservoir) < MAX_POINTS:
+                reservoir.append(row)
+            else:
+                j = rng.integers(0, accepted)
+                if j < MAX_POINTS:
+                    reservoir[j] = row
+
+    cols = ["lat", "lon"] + (["val"] if value_col else [])
+    return pd.DataFrame(reservoir, columns=cols)
 
 # ---------- palettes & breaks -------------------------------------------------
 BASE_PALETTES = {
@@ -119,7 +161,7 @@ BASE_PALETTES = {
     "Viridis":  ["#440154", "#414487", "#2a788e", "#22a884", "#7ad151"],
     "Plasma":   ["#0d0887", "#6a00a8", "#b12a90", "#e16462", "#fca636"],
     "Cividis":  ["#00204d", "#2b4066", "#566979", "#8f9c7f", "#d4e06b"],
-    "Greys":    ["#f7f7f7", "#cccccc", "#969696", "#636363", "#252525"],  # 参考
+    "Greys":    ["#f7f7f7", "#cccccc", "#969696", "#636363", "#252525"],
 }
 
 def _hex_to_rgb(h): h = h.lstrip("#"); return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
@@ -127,7 +169,6 @@ def _rgb_to_hex(rgb): return "#%02x%02x%02x" % rgb
 def _lerp(a, b, t): return tuple(int(round(a[i] + (b[i]-a[i]) * t)) for i in range(3))
 
 def _palette_to_bins(base_colors, bins: int):
-    """基礎パレットを等間隔補間して bins 色を生成"""
     if bins <= 1:
         return [base_colors[0]]
     pts = np.linspace(0, len(base_colors) - 1, bins)
@@ -141,8 +182,7 @@ def _palette_to_bins(base_colors, bins: int):
         out.append(_rgb_to_hex(_lerp(a, b, t)))
     return out
 
-def _build_breaks_auto(vmin: float, vmax: float, bins: int, inner_bounds: list[float] | None):
-    """vmin/vmax は自動推定。inner_bounds は bins-1 個（任意）。"""
+def _build_breaks_auto(vmin: float, vmax: float, bins: int, inner_bounds: List[float] | None):
     if inner_bounds and len(inner_bounds) == bins - 1:
         bounds = sorted(float(x) for x in inner_bounds)
     else:
@@ -151,11 +191,11 @@ def _build_breaks_auto(vmin: float, vmax: float, bins: int, inner_bounds: list[f
 
 # ---------- features for point plotting --------------------------------------
 def _features_with_color(work: pd.DataFrame, breaks, colors, progress):
+    import bisect
     coords = np.column_stack((work["lon"].to_numpy(), work["lat"].to_numpy()))
     has_val = "val" in work.columns
     vals = work["val"].to_numpy() if has_val else None
 
-    import bisect
     feats = []; n = len(coords); step = max(1, n // 80)
     for i, (x, y) in enumerate(coords, 1):
         if has_val:
@@ -173,20 +213,8 @@ def _features_with_color(work: pd.DataFrame, breaks, colors, progress):
             progress.progress(10 + int(80 * i / n), text=f"点データ準備中... {i:,}/{n:,}")
     return feats
 
-# ---------- sampling ----------------------------------------------------------
-def _apply_sampling(df: pd.DataFrame, pct: float, seed: int | None = 0) -> pd.DataFrame:
-    """0.01–100% で行サンプリングを実施（5段階UIを想定）"""
-    pct = max(0.01, min(100.0, float(pct)))
-    if pct >= 99.999 or len(df) == 0:
-        return df
-    n = int(round(len(df) * pct / 100.0))
-    if n <= 0:
-        return df.iloc[0:0]
-    return df.sample(n=n, random_state=seed)
-
 # ---------- mesh helpers ------------------------------------------------------
 def _estimate_deg_for_km(cell_km: float, center_lat: float):
-    """km を中心緯度の度数に換算（緯度は約 111km/deg、経度は 111*cosφ km/deg）"""
     deg_lat = cell_km / 111.0
     cosphi = max(0.1, math.cos(math.radians(center_lat)))
     deg_lon = cell_km / (111.0 * cosphi)
@@ -201,16 +229,11 @@ def _make_gradient(min_hex: str, max_hex: str, bins: int):
     return cols
 
 def _mesh_geojson_by_cellsize(work: pd.DataFrame, cell_km: float, colors, bins=7):
-    """
-    点群を lon/lat の 2D ヒストグラムに集計し、セルサイズ[km]でビンを決めて
-    各ビンをポリゴンで表現する GeoJSON を返す。colors は濃淡の配列。
-    """
     min_lon, max_lon = float(work["lon"].min()), float(work["lon"].max())
     min_lat, max_lat = float(work["lat"].min()), float(work["lat"].max())
     lat0 = float(work["lat"].mean())
     dlon, dlat = _estimate_deg_for_km(cell_km, lat0)
 
-    # 余白を少し
     pad_lon = (max_lon - min_lon) * 0.01 or dlon
     pad_lat = (max_lat - min_lat) * 0.01 or dlat
     min_lon -= pad_lon; max_lon += pad_lon
@@ -224,7 +247,7 @@ def _mesh_geojson_by_cellsize(work: pd.DataFrame, cell_km: float, colors, bins=7
         work["lon"].to_numpy(), work["lat"].to_numpy(),
         bins=[nx, ny], range=[[min_lon, max_lon], [min_lat, max_lat]]
     )
-    counts = H.T  # shape (ny, nx)
+    counts = H.T
 
     qs = np.linspace(0, 1, bins + 1)[1:-1]
     thr = [float(np.quantile(counts[counts > 0], q)) if np.any(counts > 0) else 1.0 for q in qs]
@@ -256,7 +279,6 @@ def _mesh_geojson_by_cellsize(work: pd.DataFrame, cell_km: float, colors, bins=7
 
 # ---------- legend helpers ----------------------------------------------------
 def _legend_block(items):
-    # items : list of (label, color_hex)
     html = '<div style="display:flex;align-items:center;flex-wrap:wrap;gap:10px;">'
     for label, col in items:
         html += (
@@ -281,7 +303,6 @@ def _legend_for_points(breaks, colors):
     return _legend_block(items)
 
 def _legend_for_mesh(thr, colors):
-    # thr: len==bins-1
     bounds = [0.0] + [float(x) for x in thr]
     items = []
     for i, col in enumerate(colors):
@@ -296,7 +317,6 @@ def _legend_for_mesh(thr, colors):
     return _legend_block(items)
 
 def _legend_for_heatmap():
-    # HeatMap の凡例（簡易説明）
     html = _legend_block([
         ("低密度", "#ffffb2"),
         ("中密度", "#fd8d3c"),
@@ -308,7 +328,6 @@ def _legend_for_heatmap():
 def show_map_plot_tab():
     st.header("地図にプロット")
 
-    # タイトル右に「表示例を見る」ポップアップ
     c1, c2 = st.columns([1, 0.25])
     with c1:
         st.write("緯度経度を持つデータを地図にプロットできます")
@@ -324,34 +343,26 @@ def show_map_plot_tab():
                 st.image(HEAT_IMG, use_container_width=True)
 
     st.write("ZIP/CSVファイルをアップロードしてください（複数選択できません）")
-    st.write("※各ファイル最大30GBまで対応（ただし容量の大きなファイルは処理できない可能性があります）")
+    st.write("※各ファイル最大30GBまで対応（ただし容量が非常に大きい場合はサンプリング表示になります）")
 
-    up = st.file_uploader(
-        "",
-        type=["zip", "csv"],
-        accept_multiple_files=False,
-        label_visibility="collapsed",
-    )
-
+    up = st.file_uploader("", type=["zip", "csv"], accept_multiple_files=False, label_visibility="collapsed")
     if not up:
         st.info("ファイルをアップロードしてください。")
         return
 
-    # --- 入力読込 -----------------------------------------------------------
+    # --- プレビュー＆自動判定（先頭のみ） -----------------------------------
     try:
-        df, src = _read_first_csv(up)
+        auto_lon, auto_lat, head_df = _autodetect_with_sample(up)
     except Exception as e:
         st.exception(e); return
-    if df is None or df.empty:
+    if head_df is None or head_df.empty:
         st.warning("有効なデータが見つかりません"); return
 
-    # プレビュー（10 行）＋Excel列ラベル＋自動判定列を着色
-    st.caption(f"プレビュー: {src}")
-    label_map = _excel_label_map(df.columns)
-    preview = df.head(10).copy()
+    st.caption(f"プレビュー: {up.name}")
+    label_map = _excel_label_map(head_df.columns)
+    preview = head_df.head(10).copy()
     preview.columns = list(label_map.keys())
 
-    auto_lon, auto_lat = _autodetect_lon_lat(df)
     lat_label_auto = next((k for k, v in label_map.items() if v == auto_lat), None)
     lon_label_auto = next((k for k, v in label_map.items() if v == auto_lon), None)
 
@@ -368,13 +379,13 @@ def show_map_plot_tab():
     with st.expander("緯度・経度の列が自動判定されない場合はこちらを設定",
                      expanded=(auto_lon is None or auto_lat is None)):
         labels = list(label_map.keys())
-        c1, c2 = st.columns(2)
-        lat_label_sel = c1.selectbox(
+        c3, c4 = st.columns(2)
+        lat_label_sel = c3.selectbox(
             "緯度の列を指定してください",
             options=["自動検出"] + labels,
             index=(labels.index(lat_label_auto) + 1) if lat_label_auto in labels else 0
         )
-        lon_label_sel = c2.selectbox(
+        lon_label_sel = c4.selectbox(
             "経度の列を指定してください",
             options=["自動検出"] + labels,
             index=(labels.index(lon_label_auto) + 1) if lon_label_auto in labels else 0
@@ -384,11 +395,8 @@ def show_map_plot_tab():
 
     # ---- 描画オプション -----------------------------------------------------
     st.subheader("描画オプション")
-
-    # 背景地図：淡色地図（既定）／航空写真に切替
     use_photo = st.checkbox("ベースマップを航空写真にする", value=False)
 
-    # サンプリング：5段階固定
     samp_labels = ["1/10,000（0.01%）", "1/1,000（0.1%）", "1/100（1%）", "1/10（10%）", "1/1（100%）"]
     samp_values = [0.01, 0.1, 1.0, 10.0, 100.0]
     copt1, copt2 = st.columns([1, 1.4])
@@ -403,29 +411,27 @@ def show_map_plot_tab():
         help="データ量に応じて選択してください"
     )
 
-    # 値で色分け（個々の点のみ表示）
+    # 値で色分け（個々の点のみ）
     use_color = False
     bins = 5
     base_palette = "Red→Blue"
-    point_radius = 2.2  # 追加: 点サイズ
+    point_radius = 2.2
+    value_col = None
     if draw_method == "個々の点をプロット":
         st.markdown("**値で色分け**")
         use_color = st.checkbox("値で色分けする", value=False)
-        point_radius = st.slider(
-            "点のサイズ（半径・px）", min_value=1.0, max_value=8.0, value=2.2, step=0.2,
-            help="プロットする点（CircleMarker）の半径（ピクセル）"
-        )
+        point_radius = st.slider("点のサイズ（半径・px）", 1.0, 8.0, 2.2, 0.2)
         if use_color:
             labels = list(label_map.keys())
             value_label = st.selectbox("色分けに使う列ラベルを選択してください", options=labels, index=0)
             value_col = label_map[value_label]
 
-            s = pd.to_numeric(df[value_col], errors="coerce")
+            s = pd.to_numeric(head_df[value_col], errors="coerce")
             vmin_auto = float(s.min(skipna=True)); vmax_auto = float(s.max(skipna=True))
 
-            c1, c2 = st.columns([1, 2])
-            bins = int(c1.number_input("レンジ数", min_value=3, max_value=9, value=5, step=1))
-            base_palette = c2.selectbox("使用するカラーセット", list(BASE_PALETTES.keys()), index=0)
+            c5, c6 = st.columns([1, 2])
+            bins = int(c5.number_input("レンジ数", min_value=3, max_value=9, value=5, step=1))
+            base_palette = c6.selectbox("使用するカラーセット", list(BASE_PALETTES.keys()), index=0)
 
             with st.expander("カラーや閾値の詳細設定", expanded=False):
                 init_bounds = list(np.linspace(vmin_auto, vmax_auto, bins + 1)[1:-1])
@@ -440,7 +446,6 @@ def show_map_plot_tab():
                         cc1.markdown("&nbsp;", unsafe_allow_html=True)
                     col = cc2.color_picker(f"カラー{i+1}", value=init_colors[i], key=f"color_{i}")
                     colors_ui.append(col)
-
                 st.session_state["ui_inner_bounds"] = inner_bounds_ui
                 st.session_state["ui_colors"] = colors_ui
                 st.session_state["ui_vmin_auto"] = vmin_auto
@@ -454,9 +459,8 @@ def show_map_plot_tab():
         st.session_state["ui_inner_bounds"] = None
         st.session_state["ui_colors"] = None
         st.session_state["color_value_label"] = None
-        value_col = None
 
-    # メッシュ表示：セルサイズ 10段階 & 2色指定（最小～最大）
+    # メッシュ設定
     mesh_cell_km = None
     mesh_min_color = "#ffff00"
     mesh_max_color = "#d73027"
@@ -467,184 +471,173 @@ def show_map_plot_tab():
         ]
         size_values = [10.0, 5.0, 2.0, 1.0, 0.5, 0.25, 0.2, 0.15, 0.125, 0.1]
         m1, m2 = st.columns([1, 1])
-        sel = m1.select_slider("メッシュサイズ", options=size_labels, value=size_labels[3],
-                               help="最大10km～最小100mまでの10段階。")
+        sel = m1.select_slider("メッシュサイズ", options=size_labels, value=size_labels[3])
         mesh_cell_km = size_values[size_labels.index(sel)]
         mesh_min_color = m2.color_picker("メッシュ最小レンジ色", value=mesh_min_color)
         mesh_max_color = st.color_picker("メッシュ最大レンジ色", value=mesh_max_color)
 
-    # ヒートマップ：クラスタリング 5段階（わかりやすい表現）
+    # ヒートマップ設定
     heat_level = None
     if draw_method == "ヒートマップ":
         level_label = st.select_slider(
             "密度の見せ方",
             options=["細かい", "やや細かい", "普通", "やや粗い", "粗い"],
             value="普通",
-            help="左ほど局所的（小さな半径）、右ほど広域的（大きな半径）にぼかして表示。"
         )
-        lvl_map = {
-            "細かい": (6, 8),
-            "やや細かい": (10, 12),
-            "普通": (15, 18),
-            "やや粗い": (20, 24),
-            "粗い": (30, 36),
-        }
+        lvl_map = {"細かい": (6, 8), "やや細かい": (10, 12), "普通": (15, 18), "やや粗い": (20, 24), "粗い": (30, 36)}
         heat_level = lvl_map[level_label]
 
     # ---- session init -------------------------------------------------------
-    if "work_df" not in st.session_state:
-        st.session_state["work_df"] = None
-    if "features" not in st.session_state:
-        st.session_state["features"] = None
-    if "last_map_html" not in st.session_state:
-        st.session_state["last_map_html"] = None
-    if "render_id" not in st.session_state:
-        st.session_state["render_id"] = 0
+    for k, v in [("work_df", None), ("features", None), ("last_map_html", None), ("render_id", 0)]:
+        if k not in st.session_state:
+            st.session_state[k] = v
 
-    # ★ 表示順を固定：ボタン → 進捗 → 地図 → DL → 凡例
     start = st.button("地図を描画する")
     progress_slot = st.empty()
     map_slot = st.empty()
     download_slot = st.empty()
     legend_slot = st.empty()
 
-    if start:
-        progress = progress_slot.progress(0, text="前処理中...")
+    if not start:
+        return
 
-        # 値色分け列（個点時のみ）
-        if draw_method == "個々の点をプロット" and use_color and st.session_state.get("color_value_label"):
-            value_col = label_map[st.session_state["color_value_label"]]
+    progress = progress_slot.progress(0, text="前処理中...")
+
+    # 値色分け列（個点時のみ）
+    if draw_method == "個々の点をプロット" and use_color and st.session_state.get("color_value_label"):
+        value_col = label_map[st.session_state["color_value_label"]]
+    else:
+        value_col = None
+
+    # 緯度経度列の確定
+    lon_col = lon_override if lon_override else (auto_lon or None)
+    lat_col = lat_override if lat_override else (auto_lat or None)
+    if not lon_col or not lat_col:
+        progress.progress(100, text="エラー"); st.error("緯度・経度列を決定できません"); return
+
+    # ストリーミングで抽出
+    try:
+        work = _stream_sample_points(up, value_col=value_col, lon_col=lon_col, lat_col=lat_col,
+                                     keep_pct=sampling_pct)
+    except Exception as e:
+        progress.progress(100, text="エラー"); st.exception(e); return
+
+    if work.empty:
+        progress.progress(100, text="完了"); st.warning("日本域内に有効な点がありません。"); return
+
+    st.session_state["work_df"] = work
+    if len(work) >= MAX_POINTS:
+        st.info(f"データが非常に多いため、{MAX_POINTS:,} 点にサンプリングして表示しています。"
+                "より正確な密度把握には『メッシュ表示』または『ヒートマップ』をご利用ください。")
+
+    # breaks & colors（個点のみ）
+    if draw_method == "個々の点をプロット" and value_col and "val" in work.columns:
+        vmin = float(st.session_state.get("ui_vmin_auto", float(np.nanmin(work["val"]))))
+        vmax = float(st.session_state.get("ui_vmax_auto", float(np.nanmax(work["val"]))))
+        inner = st.session_state.get("ui_inner_bounds")
+        colors = st.session_state.get("ui_colors")
+        bins_local = len(colors) if colors else 5
+        breaks = _build_breaks_auto(vmin, vmax, bins_local, inner)
+        if not colors or len(colors) != bins_local:
+            colors = _palette_to_bins(BASE_PALETTES[base_palette], bins_local)
+    else:
+        breaks = [0, 1]; colors = ["#E67814"]
+
+    progress.progress(10, text="点データ準備中...")
+
+    # -------- Folium 描画 ----------------------------------------------------
+    import folium
+    from streamlit_folium import st_folium
+
+    center = (float(work["lat"].mean()), float(work["lon"].mean()))
+    fmap = folium.Map(location=center, zoom_start=11, tiles=None, control_scale=True, prefer_canvas=True)
+
+    # ベースマップ
+    if use_photo:
+        folium.TileLayer(
+            tiles="https://cyberjapandata.gsi.go.jp/xyz/seamlessphoto/{z}/{x}/{y}.jpg",
+            attr="地理院地図（航空写真）", name="GSI Photo", overlay=False, control=False, max_zoom=18
+        ).add_to(fmap)
+    else:
+        folium.TileLayer(
+            tiles="https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png",
+            attr="地理院地図（淡色）", name="GSI Pale", overlay=False, control=False, max_zoom=18
+        ).add_to(fmap)
+
+    legend_html = ""
+
+    if draw_method == "ヒートマップ":
+        from folium.plugins import HeatMap
+        if "val" in work.columns:
+            points = work[["lat", "lon", "val"]].dropna().values.tolist()
         else:
-            value_col = None
+            points = work[["lat", "lon"]].dropna().values.tolist()
+        r, b = heat_level if heat_level else (15, 18)
+        HeatMap(points, radius=r, blur=b, max_zoom=18).add_to(fmap)
+        legend_html = _legend_for_heatmap()
 
-        # 前処理
-        try:
-            work = _make_work_df(df, value_col, lon_override=lon_override, lat_override=lat_override)
-        except Exception as e:
-            progress.progress(100, text="エラー"); st.exception(e); return
+    elif draw_method == "メッシュ表示":
+        bins_mesh = 7
+        mesh_palette = _make_gradient("#ffff00", "#d73027", bins_mesh)
+        cell_km = mesh_cell_km if mesh_cell_km is not None else 2.0
+        fc, thr = _mesh_geojson_by_cellsize(work, cell_km=cell_km, colors=mesh_palette, bins=bins_mesh)
+        folium.GeoJson(
+            data=_dumps(fc),
+            name="mesh",
+            style_function=lambda feat: {"fillColor": feat["properties"]["c"],
+                                         "color": feat["properties"]["c"],
+                                         "weight": 0.5, "fillOpacity": 0.55},
+            control=False, show=True,
+        ).add_to(fmap)
+        legend_html = _legend_for_mesh(thr, mesh_palette)
 
-        # サンプリング
-        work = _apply_sampling(work, sampling_pct, seed=0)
-        st.session_state["work_df"] = work
+    else:  # 個々の点
+        feats = _features_with_color(work, breaks, colors, progress)
+        st.session_state["features"] = feats
+        from collections import defaultdict
+        total = len(feats); done = 0
+        for s in range(0, total, BATCH_GEOJSON):
+            batch = feats[s:s+BATCH_GEOJSON]
+            groups = defaultdict(list)
+            for f in batch:
+                groups[f["properties"]["c"]].append(f)
+            for col, items in groups.items():
+                fc = {"type": "FeatureCollection", "features": items}
+                folium.GeoJson(
+                    data=_dumps(fc),
+                    name=f"p_{s}_{col}",
+                    marker=folium.CircleMarker(
+                        radius=point_radius, color=col, fill=True,
+                        fill_color=col, fill_opacity=0.7, weight=0
+                    ),
+                    control=False, show=True,
+                ).add_to(fmap)
+            done = min(total, s + BATCH_GEOJSON)
+            progress.progress(95 + int(4 * done / total), text=f"地図を描画中... {done:,}/{total:,}")
+        legend_html = _legend_for_points(breaks, colors)
 
-        # breaks & colors（個点のみ）
-        if draw_method == "個々の点をプロット" and value_col:
-            vmin = float(st.session_state.get("ui_vmin_auto", float(np.nanmin(work["val"]))))
+    # 表示：地図 → DL → 凡例
+    map_slot.empty()
+    st.session_state["render_id"] += 1
+    render_key = f"map-{st.session_state['render_id']}"
+    with map_slot:
+        st_folium(fmap, width=None, height=640, returned_objects=[], key=render_key)
 
-            vmax = float(st.session_state.get("ui_vmax_auto", float(np.nanmax(work["val"]))))
+    html = fmap.get_root().render()
+    st.session_state["last_map_html"] = html
 
-            inner = st.session_state.get("ui_inner_bounds")
-            colors = st.session_state.get("ui_colors")
-            bins_local = len(colors) if colors else 5
-            breaks = _build_breaks_auto(vmin, vmax, bins_local, inner)
-            if not colors or len(colors) != bins_local:
-                colors = _palette_to_bins(BASE_PALETTES[base_palette], bins_local)
-        else:
-            breaks = [0, 1]; colors = ["#E67814"]
+    download_slot.empty()
+    with download_slot:
+        st.download_button(
+            "地図をHTML形式でダウンロード",
+            data=html.encode("utf-8"),
+            file_name="map.html",
+            mime="text/html",
+            key=f"dl-{st.session_state['render_id']}",
+        )
 
-        progress.progress(10, text="点データ準備中...")
+    if legend_html:
+        legend_slot.markdown("**凡例：**", help="色の範囲を示します。")
+        legend_slot.markdown(legend_html, unsafe_allow_html=True)
 
-        # -------- Folium 描画 ------------------------------------------------
-        import folium
-        from streamlit_folium import st_folium
-
-        center = (float(work["lat"].mean()), float(work["lon"].mean()))
-        fmap = folium.Map(location=center, zoom_start=11, tiles=None,
-                          control_scale=True, prefer_canvas=True)
-
-        # ベースマップ：淡色地図 / 航空写真
-        if use_photo:
-            folium.TileLayer(
-                tiles="https://cyberjapandata.gsi.go.jp/xyz/seamlessphoto/{z}/{x}/{y}.jpg",
-                attr="地理院地図（航空写真）", name="GSI Photo", overlay=False, control=False, max_zoom=18
-            ).add_to(fmap)
-        else:
-            folium.TileLayer(
-                tiles="https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png",
-                attr="地理院地図（淡色）", name="GSI Pale", overlay=False, control=False, max_zoom=18
-            ).add_to(fmap)
-
-        legend_html = ""  # 後で設定
-
-        if draw_method == "ヒートマップ":
-            from folium.plugins import HeatMap
-            if "val" in work.columns:
-                points = work[["lat", "lon", "val"]].dropna().values.tolist()
-            else:
-                points = work[["lat", "lon"]].dropna().values.tolist()
-            r, b = heat_level if heat_level else (15, 18)
-            HeatMap(points, radius=r, blur=b, max_zoom=18).add_to(fmap)
-            legend_html = _legend_for_heatmap()
-
-        elif draw_method == "メッシュ表示":
-            bins_mesh = 7
-            mesh_palette = _make_gradient(mesh_min_color, mesh_max_color, bins_mesh)
-            cell_km = mesh_cell_km if mesh_cell_km is not None else 2.0
-            fc, thr = _mesh_geojson_by_cellsize(work, cell_km=cell_km, colors=mesh_palette, bins=bins_mesh)
-            folium.GeoJson(
-                data=_dumps(fc),
-                name="mesh",
-                style_function=lambda feat: {
-                    "fillColor": feat["properties"]["c"],
-                    "color": feat["properties"]["c"],
-                    "weight": 0.5,
-                    "fillOpacity": 0.55,
-                },
-                control=False, show=True,
-            ).add_to(fmap)
-            legend_html = _legend_for_mesh(thr, mesh_palette)
-
-        else:  # 個々の点をプロット
-            feats = _features_with_color(work, breaks, colors, progress)
-            st.session_state["features"] = feats
-            from collections import defaultdict
-            BATCH = 50_000
-            total = len(feats); done = 0
-            for s in range(0, total, BATCH):
-                batch = feats[s:s+BATCH]
-                groups = defaultdict(list)
-                for f in batch:
-                    groups[f["properties"]["c"]].append(f)
-                for col, items in groups.items():
-                    fc = {"type": "FeatureCollection", "features": items}
-                    folium.GeoJson(
-                        data=_dumps(fc),
-                        name=f"p_{s}_{col}",
-                        marker=folium.CircleMarker(
-                            radius=point_radius,
-                            color=col, fill=True, fill_color=col, fill_opacity=0.7, weight=0
-                        ),
-                        control=False, show=True,
-                    ).add_to(fmap)
-                done = min(total, s + BATCH)
-                progress.progress(95 + int(4 * done / total), text=f"地図を描画中... {done:,}/{total:,}")
-            # 凡例
-            legend_html = _legend_for_points(breaks, colors)
-
-        # 表示：プログレスバー → 地図 → DLボタン → 凡例
-        map_slot.empty()
-        st.session_state["render_id"] += 1
-        render_key = f"map-{st.session_state['render_id']}"
-        with map_slot:
-            st_folium(fmap, width=None, height=640, returned_objects=[], key=render_key)
-
-        html = fmap.get_root().render()
-        st.session_state["last_map_html"] = html
-
-        download_slot.empty()
-        with download_slot:
-            st.download_button(
-                "地図をHTML形式でダウンロード",
-                data=html.encode("utf-8"),
-                file_name="map.html",
-                mime="text/html",
-                key=f"dl-{st.session_state['render_id']}",
-            )
-
-        if legend_html:
-            legend_slot.markdown("**凡例：**", help="色の範囲を示します。")
-            legend_slot.markdown(legend_html, unsafe_allow_html=True)
-
-        progress.progress(100, text="完了")
-
-    # 再訪時は何も描画しない（直前の結果はボタン押下でのみ更新）
+    progress.progress(100, text="完了")
