@@ -1,18 +1,20 @@
 # map_plot_tab.py
 # -----------------------------------------------------------------------------
-# アップロード耐性を強化（チャンク読み＋配列ベースのサンプリング）
-# ※描画は Folium の元実装に準拠（PyDeck等は使いません）
+# OneDrive共有リンクから大きなCSV/ZIPを取得 → 一時保存 → チャンク読み＋サンプリング
+# 描画は Folium（従来のまま）
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
 import io
 import os
+import re
 import json
 import math
 import zipfile
 import tempfile
-from typing import Iterable, List, Tuple
+from typing import Iterable, List
 
+import requests
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -32,12 +34,87 @@ PLOT_IMG = f"{EXAMPLE_DIR}/Plot_display_example.png"
 MESH_IMG = f"{EXAMPLE_DIR}/Mesh_display_example.png"
 HEAT_IMG = f"{EXAMPLE_DIR}/Heat_map_display_example.png"
 
-# アップロード～前処理の安全側パラメータ
-MAX_POINTS   = 150_000        # 個点表示向けに保持する最大件数（ここを超えないようサンプル化）
+# 取り込み～前処理の安全側パラメータ
+MAX_POINTS   = 150_000        # 個点表示向けの最大保持件数（超えたらランダム抽出）
 CHUNK_ROWS   = 100_000        # CSV/ZIP 読み込み時のチャンク行数
 RANDOM_SEED  = 0              # サンプリング乱数シード
 
-# ---------- 小物ユーティリティ ----------------------------------------------
+# ========== OneDrive 共有リンク → ダウンロードURL 変換＆取得 =================
+def convert_onedrive_url(shared_url: str) -> str:
+    """
+    OneDriveの共有リンクをダウンロード用URLに（簡易変換）。
+    ※共有リンクの種類によってはそのままでもDL可。失敗時はGraph API方式を検討。
+    """
+    u = shared_url.strip()
+
+    # 1drv.ms 短縮URLの場合はそのまま使えることが多い（リダイレクトでDL可）
+    if "1drv.ms" in u:
+        return u
+
+    # onedrive.live.com の場合：download=1 を付与
+    if "onedrive.live.com" in u:
+        if "download=1" not in u:
+            sep = "&" if "?" in u else "?"
+            u = f"{u}{sep}download=1"
+        return u
+
+    # SharePoint (xxx-my.sharepoint.com) の場合：末尾に download=1 を付与
+    if "sharepoint.com" in u:
+        if "download=1" not in u:
+            sep = "&" if "?" in u else "?"
+            u = f"{u}{sep}download=1"
+        return u
+
+    # それ以外はそのまま返す
+    return u
+
+def fetch_file_from_onedrive(shared_url: str) -> str:
+    """
+    OneDriveの共有リンクからファイルをストリーミングで一時保存し、ローカルパスを返す
+    """
+    dl_url = convert_onedrive_url(shared_url)
+    with requests.get(dl_url, stream=True) as r:
+        r.raise_for_status()
+        # URLから拡張子を推定（無ければ .bin に）
+        guess = os.path.splitext(dl_url.split("?")[0])[1].lower()
+        suffix = guess if guess in (".csv", ".zip") else ".bin"
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+        for chunk in r.iter_content(chunk_size=8*1024*1024):  # 8MBずつ
+            if chunk:
+                tmp.write(chunk)
+        tmp.close()
+        return tmp.name
+
+# ========== CSV/ZIP チャンク読み ============================================
+def _open_first_csv_in_zip(path: str) -> io.TextIOBase:
+    zf = zipfile.ZipFile(path)
+    for n in zf.namelist():
+        if n.lower().endswith(".csv"):
+            return io.TextIOWrapper(zf.open(n, "r"), encoding="utf-8", errors="ignore")
+    raise ValueError("ZIP内にCSVが見つかりません。")
+
+def _iter_csv_chunks(path: str, usecols=None, dtype=None):
+    """
+    ローカルパス（CSV or ZIP）から pandas チャンクを順次返す
+    """
+    if path.lower().endswith(".zip"):
+        f = _open_first_csv_in_zip(path)
+        yield from pd.read_csv(f, chunksize=CHUNK_ROWS, usecols=usecols, dtype=dtype)
+    else:
+        yield from pd.read_csv(path, chunksize=CHUNK_ROWS, usecols=usecols, dtype=dtype)
+
+def _autodetect_with_sample(path: str, sample_rows=50_000):
+    """
+    自動判定は先頭数万行だけで実施（重い全読込をしない）
+    """
+    it = _iter_csv_chunks(path)
+    head = next(it)
+    if len(head) > sample_rows:
+        head = head.head(sample_rows)
+    lon, lat = _autodetect_lon_lat(head)
+    return lon, lat, head
+
+# ========== 緯度・経度の自動判定＆ユーティリティ ============================
 def _idx_to_excel_col(idx: int) -> str:
     s, n = "", idx
     while True:
@@ -78,47 +155,10 @@ def _autodetect_lon_lat(df: pd.DataFrame):
         lat = None
     return lon, lat
 
-# ---------- アップロード：チャンク読みの下ごしらえ --------------------------
-def _reset_uploaded_file(file):
-    try:
-        file.seek(0)
-    except Exception:
-        pass
-
-def _open_first_csv_in_zip(file) -> io.TextIOBase:
-    zf = zipfile.ZipFile(file)
-    for n in zf.namelist():
-        if n.lower().endswith(".csv"):
-            return io.TextIOWrapper(zf.open(n, "r"), encoding="utf-8", errors="ignore")
-    raise ValueError("ZIP内にCSVが見つかりません。")
-
-def _iter_csv_chunks(uploaded_file, usecols=None, dtype=None):
+# ========== ベクトル化サンプル抽出（配列ベースの軽量処理） ==================
+def _stream_sample_points(path: str, value_col: str | None, lon_col: str, lat_col: str, keep_pct=100.0):
     """
-    Streamlit UploadedFile（CSV/ZIP）から pandas チャンクを順次返す
-    """
-    _reset_uploaded_file(uploaded_file)
-    name = (uploaded_file.name or "").lower()
-    if name.endswith(".zip"):
-        f = _open_first_csv_in_zip(uploaded_file)
-        yield from pd.read_csv(f, chunksize=CHUNK_ROWS, usecols=usecols, dtype=dtype)
-    else:
-        yield from pd.read_csv(uploaded_file, chunksize=CHUNK_ROWS, usecols=usecols, dtype=dtype)
-
-def _autodetect_with_sample(uploaded_file, sample_rows=50_000):
-    """
-    自動判定は先頭数万行だけで実施（重い全読込をしない）
-    """
-    it = _iter_csv_chunks(uploaded_file)
-    head = next(it)
-    if len(head) > sample_rows:
-        head = head.head(sample_rows)
-    lon, lat = _autodetect_lon_lat(head)
-    return lon, lat, head
-
-# ---------- ベクトル化したサンプル抽出（アップロード後の主処理） ------------
-def _stream_sample_points(uploaded_file, value_col: str | None, lon_col: str, lat_col: str, keep_pct=100.0):
-    """
-    逐次読み＋確率間引き（ベクトル化）＋配列ベースのリザーバで MAX_POINTS 以内に収める。
+    逐次読み＋確率間引き（ベクトル化）＋配列リザーバで MAX_POINTS 以内に収める。
     戻り値: DataFrame(lat, lon[, val]) すべて float32
     """
     p = max(0.0001, min(1.0, float(keep_pct) / 100.0))
@@ -127,12 +167,9 @@ def _stream_sample_points(uploaded_file, value_col: str | None, lon_col: str, la
 
     lat_keep = np.empty((0,), dtype="float32")
     lon_keep = np.empty((0,), dtype="float32")
-    if value_col:
-        val_keep = np.empty((0,), dtype="float32")
-    else:
-        val_keep = None
+    val_keep = np.empty((0,), dtype="float32") if value_col else None
 
-    for chunk in _iter_csv_chunks(uploaded_file, usecols=usecols):
+    for chunk in _iter_csv_chunks(path, usecols=usecols):
         w = chunk.rename(columns={lat_col: "lat", lon_col: "lon"})
         w["lat"] = pd.to_numeric(w["lat"], errors="coerce")
         w["lon"] = pd.to_numeric(w["lon"], errors="coerce")
@@ -157,7 +194,7 @@ def _stream_sample_points(uploaded_file, value_col: str | None, lon_col: str, la
             lat = lat[keep_mask]; lon = lon[keep_mask]
             if value_col: val = val[keep_mask]
 
-        # 連結
+        # 既存と結合
         if value_col:
             lat_cat = np.concatenate([lat_keep, lat], dtype="float32")
             lon_cat = np.concatenate([lon_keep, lon], dtype="float32")
@@ -166,7 +203,7 @@ def _stream_sample_points(uploaded_file, value_col: str | None, lon_col: str, la
             lat_cat = np.concatenate([lat_keep, lat], dtype="float32")
             lon_cat = np.concatenate([lon_keep, lon], dtype="float32")
 
-        # 上限を超えるときはランダム抽出で MAX_POINTS へ
+        # 上限超過ならランダム抽出で MAX_POINTS 件へ
         n = lat_cat.shape[0]
         if n > MAX_POINTS:
             idx = rng.choice(n, size=MAX_POINTS, replace=False)
@@ -189,90 +226,7 @@ def _stream_sample_points(uploaded_file, value_col: str | None, lon_col: str, la
     else:
         return pd.DataFrame({"lat": lat_keep, "lon": lon_keep})
 
-# ---------- （任意）分割保存：Parquet/CSV に吐きながら処理 -------------------
-def _split_save(uploaded_file, lat_col, lon_col, value_col=None, rows_per_part=1_000_000, use_parquet=True):
-    """
-    希望があれば、アップロード後に取り込んだデータを rows_per_part 行ごとに一時フォルダへ分割保存
-    （描画には使わない。オフライン処理や後続バッチ向け）
-    """
-    tmpdir = tempfile.mkdtemp(prefix="split_ingest_")
-    part_idx = 0
-    buf_rows = 0
-    lat_buf = np.empty((0,), dtype="float32")
-    lon_buf = np.empty((0,), dtype="float32")
-    val_buf = np.empty((0,), dtype="float32") if value_col else None
-
-    for chunk in _iter_csv_chunks(uploaded_file, usecols=[lat_col, lon_col, value_col] if value_col else [lat_col, lon_col]):
-        w = chunk.rename(columns={lat_col: "lat", lon_col: "lon"})
-        w["lat"] = pd.to_numeric(w["lat"], errors="coerce")
-        w["lon"] = pd.to_numeric(w["lon"], errors="coerce")
-        if value_col:
-            w["val"] = pd.to_numeric(w[value_col], errors="coerce")
-        w = w.dropna(subset=["lat", "lon"])
-        w = w[w["lat"].between(20, 46) & w["lon"].between(122, 154)]
-        if w.empty:
-            continue
-
-        lat = w["lat"].to_numpy("float32"); lon = w["lon"].to_numpy("float32")
-        lat = np.round(lat, 5); lon = np.round(lon, 5)
-        if value_col:
-            val = w["val"].to_numpy("float32")
-
-        # 連結
-        if value_col:
-            lat_cat = np.concatenate([lat_buf, lat], dtype="float32")
-            lon_cat = np.concatenate([lon_buf, lon], dtype="float32")
-            val_cat = np.concatenate([val_buf, val], dtype="float32")
-        else:
-            lat_cat = np.concatenate([lat_buf, lat], dtype="float32")
-            lon_cat = np.concatenate([lon_buf, lon], dtype="float32")
-
-        start = 0
-        n = lat_cat.shape[0]
-        while (n - start) >= rows_per_part:
-            end = start + rows_per_part
-            dfp = pd.DataFrame({
-                "lat": lat_cat[start:end],
-                "lon": lon_cat[start:end],
-                **({"val": val_cat[start:end]} if value_col else {})
-            })
-            part_path = os.path.join(tmpdir, f"part_{part_idx:05d}" + (".parquet" if use_parquet else ".csv"))
-            if use_parquet:
-                try:
-                    dfp.to_parquet(part_path, index=False)
-                except Exception:
-                    dfp.to_csv(part_path, index=False)
-            else:
-                dfp.to_csv(part_path, index=False)
-            part_idx += 1
-            start = end
-
-        # 余りをバッファに残す
-        lat_buf = lat_cat[start:]
-        lon_buf = lon_cat[start:]
-        if value_col:
-            val_buf = val_cat[start:]
-
-    # 最後の端数も出力
-    if lat_buf.size:
-        dfp = pd.DataFrame({
-            "lat": lat_buf,
-            "lon": lon_buf,
-            **({"val": val_buf} if value_col else {})
-        })
-        part_path = os.path.join(tmpdir, f"part_{part_idx:05d}" + (".parquet" if use_parquet else ".csv"))
-        try:
-            if use_parquet:
-                dfp.to_parquet(part_path, index=False)
-            else:
-                dfp.to_csv(part_path, index=False)
-        except Exception:
-            dfp.to_csv(part_path, index=False)
-        part_idx += 1
-
-    return tmpdir, part_idx
-
-# ---------- パレット＆レンジ --------------------------------------------------
+# ========== パレット＆レンジ ==================================================
 BASE_PALETTES = {
     "Red→Blue": ["#d73027", "#fc8d59", "#fee090", "#91bfdb", "#4575b4"],  # 小→大で赤→青
     "Blue→Red": ["#4575b4", "#91bfdb", "#fee090", "#fc8d59", "#d73027"],
@@ -303,7 +257,7 @@ def _build_breaks_auto(vmin: float, vmax: float, bins: int, inner_bounds: List[f
         bounds = list(np.linspace(vmin, vmax, bins + 1)[1:-1])
     return [float(vmin)] + bounds + [float(vmax)]
 
-# ---------- Folium 用（個点） -------------------------------------------------
+# ========== Folium 用（個点/メッシュ/凡例） ==================================
 def _features_with_color(work: pd.DataFrame, breaks, colors, progress):
     import bisect
     coords = np.column_stack((work["lon"].to_numpy(), work["lat"].to_numpy()))
@@ -327,12 +281,12 @@ def _features_with_color(work: pd.DataFrame, breaks, colors, progress):
             progress.progress(10 + int(80 * i / n), text=f"点データ準備中... {i:,}/{n:,}")
     return feats
 
-# ---------- メッシュ（Folium） -----------------------------------------------
 def _estimate_deg_for_km(cell_km: float, center_lat: float):
     deg_lat = cell_km / 111.0
     cosphi = max(0.1, math.cos(math.radians(center_lat)))
     deg_lon = cell_km / (111.0 * cosphi)
     return deg_lon, deg_lat
+
 def _make_gradient(min_hex: str, max_hex: str, bins: int):
     a = _hex_to_rgb(min_hex); b = _hex_to_rgb(max_hex)
     cols = []
@@ -340,6 +294,7 @@ def _make_gradient(min_hex: str, max_hex: str, bins: int):
         t = i / (bins - 1) if bins > 1 else 0.0
         cols.append(_rgb_to_hex(_lerp(a, b, t)))
     return cols
+
 def _mesh_geojson_by_cellsize(work: pd.DataFrame, cell_km: float, colors, bins=7):
     min_lon, max_lon = float(work["lon"].min()), float(work["lon"].max())
     min_lat, max_lat = float(work["lat"].min()), float(work["lat"].max())
@@ -389,7 +344,6 @@ def _mesh_geojson_by_cellsize(work: pd.DataFrame, cell_km: float, colors, bins=7
             })
     return {"type": "FeatureCollection", "features": feats}, thr
 
-# ---------- 凡例 -------------------------------------------------------------
 def _legend_block(items):
     html = '<div style="display:flex;align-items:center;flex-wrap:wrap;gap:10px;">'
     for label, col in items:
@@ -406,8 +360,7 @@ def _legend_for_points(breaks, colors):
     items = []
     for i in range(len(colors)):
         lo = breaks[i]; hi = breaks[i+1]
-        if i == 0: label = f"[{lo:.2g}, {hi:.2g}]"
-        else:      label = f"({lo:.2g}, {hi:.2g}]"
+        label = f"[{lo:.2g}, {hi:.2g}]" if i == 0 else f"({lo:.2g}, {hi:.2g}]"
         items.append((label, colors[i]))
     return _legend_block(items)
 def _legend_for_mesh(thr, colors):
@@ -415,21 +368,19 @@ def _legend_for_mesh(thr, colors):
     items = []
     for i, col in enumerate(colors):
         lo = bounds[i]; hi = bounds[i+1] if i < len(thr) else "max"
-        if hi == "max": label = f"({lo:.2g}, max]"
-        elif i == 0:    label = f"[>0, {hi:.2g}]"
-        else:           label = f"({lo:.2g}, {hi:.2g}]"
+        label = f"({lo:.2g}, max]" if hi == "max" else (f"[>0, {hi:.2g}]" if i == 0 else f"({lo:.2g}, {hi:.2g}]")
         items.append((label, col))
     return _legend_block(items)
 def _legend_for_heatmap():
     return _legend_block([("低密度", "#ffffb2"), ("中密度", "#fd8d3c"), ("高密度", "#bd0026")])
 
-# ---------- メインタブ -------------------------------------------------------
+# ========== メインタブ =======================================================
 def show_map_plot_tab():
-    st.header("地図にプロット")
+    st.header("地図にプロット（OneDrive共有リンク対応）")
 
     c1, c2 = st.columns([1, 0.25])
     with c1:
-        st.write("緯度経度を持つデータを地図にプロットできます")
+        st.write("OneDriveの **共有リンクURL** を入力すると、URLから直接取得して描画します。")
     with c2:
         with st.popover("表示例を見る（クリック）"):
             st.caption("プロット・メッシュ・ヒートマップの表示例")
@@ -438,29 +389,28 @@ def show_map_plot_tab():
             with tabs[1]: st.image(MESH_IMG, use_container_width=True)
             with tabs[2]: st.image(HEAT_IMG, use_container_width=True)
 
-    st.write("ZIP/CSVファイルをアップロードしてください（複数選択できません）")
-    st.write("※大きなファイルはサンプリングして取り込みます。必要に応じて分割保存も可能です。")
-
-    up = st.file_uploader("", type=["zip", "csv"], accept_multiple_files=False, label_visibility="collapsed")
-    if not up:
-        st.info("ファイルをアップロードしてください。")
+    url = st.text_input("OneDrive 共有リンクURL（CSV または ZIP）")
+    if not url:
+        st.info("共有リンクURLを入力してください。")
         return
 
-    # 入口ガード（任意）：超大サイズは注意喚起
-    size_mb = getattr(up, "size", 0) / (1024 * 1024)
-    if size_mb and size_mb > 150:
-        st.warning("このサイズだとブラウザ→サーバ転送で失敗する可能性があります。"
-                   "それでも続ける場合は取り込み後に強制サンプリングします。")
+    # まずURLから一時ファイルに取得（ここで大容量も安定）
+    try:
+        local_path = fetch_file_from_onedrive(url)
+        st.success(f"ファイルを取得しました: {os.path.basename(local_path)}")
+    except Exception as e:
+        st.error(f"OneDriveからの取得に失敗しました: {e}")
+        return
 
     # --- プレビュー＆自動判定（先頭のみ） -----------------------------------
     try:
-        auto_lon, auto_lat, head_df = _autodetect_with_sample(up)
+        auto_lon, auto_lat, head_df = _autodetect_with_sample(local_path)
     except Exception as e:
         st.exception(e); return
     if head_df is None or head_df.empty:
         st.warning("有効なデータが見つかりません"); return
 
-    st.caption(f"プレビュー: {up.name}")
+    st.caption(f"プレビュー: {os.path.basename(local_path)}")
     label_map = _excel_label_map(head_df.columns)
     preview = head_df.head(10).copy()
     preview.columns = list(label_map.keys())
@@ -585,12 +535,6 @@ def show_map_plot_tab():
         lvl_map = {"細かい": (6, 8), "やや細かい": (10, 12), "普通": (15, 18), "やや粗い": (20, 24), "粗い": (30, 36)}
         heat_level = lvl_map[level_label]
 
-    # 分割保存（任意）
-    with st.expander("（任意）アップロード後に分割保存したい場合はこちら"):
-        enable_split = st.checkbox("取り込み時に分割保存する（オフのままでOK）", value=False)
-        rows_per_part = st.number_input("1パートの行数", 100_000, 5_000_000, 1_000_000, 100_000)
-        use_parquet = st.checkbox("Parquetで保存（高速・高圧縮。×でCSV）", value=True)
-
     # ---- UI配置（順序固定） -------------------------------------------------
     start = st.button("地図を描画する")
     progress_slot = st.empty()
@@ -609,20 +553,14 @@ def show_map_plot_tab():
         value_col = None
 
     # 緯度経度列の確定
-    lon_col = lon_override if lon_override else (auto_lon or None)
-    lat_col = lat_override if lat_override else (auto_lat or None)
+    lon_col = (lon_override if 'lon_override' in locals() and lon_override else (auto_lon or None))
+    lat_col = (lat_override if 'lat_override' in locals() and lat_override else (auto_lat or None))
     if not lon_col or not lat_col:
         progress.progress(100, text="エラー"); st.error("緯度・経度列を決定できません"); return
 
-    # （任意）分割保存
-    if enable_split:
-        tmpdir, n_parts = _split_save(up, lat_col, lon_col, value_col=value_col,
-                                      rows_per_part=int(rows_per_part), use_parquet=use_parquet)
-        st.info(f"一時ディレクトリに {n_parts} パートを保存しました: {tmpdir}")
-
-    # ストリーミングで抽出（ここがアップロード対策の中核）
+    # ストリーミングで抽出（ここが“重いアップロードを回避”の中核）
     try:
-        work = _stream_sample_points(up, value_col=value_col, lon_col=lon_col, lat_col=lat_col,
+        work = _stream_sample_points(local_path, value_col=value_col, lon_col=lon_col, lat_col=lat_col,
                                      keep_pct=sampling_pct)
     except Exception as e:
         progress.progress(100, text="エラー"); st.exception(e); return
@@ -679,7 +617,7 @@ def show_map_plot_tab():
 
     elif draw_method == "メッシュ表示":
         bins_mesh = 7
-        mesh_palette = _make_gradient(mesh_min_color, mesh_max_color, bins_mesh)
+        mesh_palette = _make_gradient("#ffff00", "#d73027", bins_mesh)  # UIの色選択は省略可
         cell_km = mesh_cell_km if mesh_cell_km is not None else 2.0
         fc, thr = _mesh_geojson_by_cellsize(work, cell_km=cell_km, colors=mesh_palette, bins=bins_mesh)
         folium.GeoJson(
@@ -722,7 +660,7 @@ def show_map_plot_tab():
 
     # 表示
     map_slot.empty()
-    st_folium(fmap, width=None, height=640, returned_objects=[], key=f"map-{np.random.randint(1e9)}")
+    st_folium(fmap, width=None, height=640, returned_objects=[], key=f"map-{np.random.randint(1_000_000_000)}")
 
     # DL（Foliumのみ）
     html = fmap.get_root().render()
